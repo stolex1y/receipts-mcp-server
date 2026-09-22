@@ -25,6 +25,9 @@ application {
 
 dependencies {
     implementation("io.modelcontextprotocol:kotlin-sdk-server:0.10.0")
+    implementation("io.ktor:ktor-server-netty-jvm:3.2.3")
+    implementation("io.ktor:ktor-server-content-negotiation-jvm:3.2.3")
+    implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:3.2.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.17")
 
