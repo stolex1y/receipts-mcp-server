@@ -23,15 +23,26 @@ application {
     applicationName = "receipts-mcp-server"
 }
 
+tasks.register<JavaExec>("runFakeServer") {
+    group = "application"
+    description = "Runs the local synthetic receipts MCP server."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("io.github.stolex1y.receipts.mcp.FakeMainKt")
+}
+
 dependencies {
     implementation("io.modelcontextprotocol:kotlin-sdk-server:0.10.0")
     implementation("io.ktor:ktor-server-netty-jvm:3.2.3")
     implementation("io.ktor:ktor-server-content-negotiation-jvm:3.2.3")
     implementation("io.ktor:ktor-serialization-kotlinx-json-jvm:3.2.3")
+    implementation("io.ktor:ktor-client-core-jvm:3.2.3")
+    implementation("io.ktor:ktor-client-cio-jvm:3.2.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+    implementation("com.github.javakeyring:java-keyring:1.0.4")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.17")
 
     testImplementation(kotlin("test"))
+    testImplementation("io.ktor:ktor-client-mock-jvm:3.2.3")
 }
 
 tasks.test {
