@@ -39,11 +39,21 @@ dependencies {
     implementation("io.ktor:ktor-client-cio-jvm:3.2.3")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
     implementation("com.github.javakeyring:java-keyring:1.0.4")
+    implementation("com.microsoft.playwright:playwright:1.62.0")
     runtimeOnly("org.slf4j:slf4j-simple:2.0.17")
 
     testImplementation(kotlin("test"))
     testImplementation("io.ktor:ktor-client-mock-jvm:3.2.3")
+    testImplementation("io.ktor:ktor-server-test-host-jvm:3.2.3")
 }
+tasks.register<JavaExec>("playwrightInstall") {
+    group = "verification"
+    description = "Installs the Chromium build used for visible receipts login."
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.microsoft.playwright.CLI")
+    args("install", "chromium")
+}
+
 
 tasks.test {
     useJUnitPlatform()

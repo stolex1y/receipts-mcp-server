@@ -180,6 +180,41 @@ class ReceiptServiceTest {
     }
 
     @Test
+    fun redirectedAPIResponseDoesNotForwardBearerRequestToLocationTarget() = runBlocking {
+        val requestHosts = mutableListOf<String>()
+        val (client, requests) = mockLkdr { request ->
+            requestHosts += request.url.host
+            if (request.url.host == "mock.lkdr.test") {
+                respond(
+                    content = "",
+                    status = HttpStatusCode.TemporaryRedirect,
+                    headers = headersOf(HttpHeaders.Location, "https://attacker.example/collect"),
+                )
+            } else {
+                respondJson("""{"brands":[],"receipts":[],"hasMore":false}""")
+            }
+        }
+        try {
+            val service = ReceiptService(
+                httpClient = client,
+                mode = ReceiptMode.PRIVATE,
+                apiBase = "https://mock.lkdr.test/api",
+                sessionProvider = ReceiptSessionProvider { "test-token" },
+            )
+
+            assertFailsWith<ReceiptIntegrationException> {
+                service.search(ReceiptSearchInput())
+            }
+
+            assertEquals(listOf("mock.lkdr.test"), requestHosts)
+            assertEquals(1, requests.size)
+            assertEquals("Bearer test-token", requests.single().headers[HttpHeaders.Authorization])
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
     fun upstreamErrorsDoNotExposeResponseSecrets() = runBlocking {
         val (client, _) = mockLkdr {
             respondJson(
@@ -279,15 +314,12 @@ private fun mockLkdr(
     responder: suspend MockRequestHandleScope.(HttpRequestData) -> HttpResponseData,
 ): Pair<HttpClient, MutableList<HttpRequestData>> {
     val requests = mutableListOf<HttpRequestData>()
-    val client = HttpClient(MockEngine) {
-        expectSuccess = false
-        engine {
-            addHandler { request ->
-                requests += request
-                responder(request)
-            }
-        }
-    }
+    val client = noRedirectHttpClient(
+        MockEngine { request ->
+            requests += request
+            responder(request)
+        },
+    )
     return client to requests
 }
 

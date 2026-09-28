@@ -29,7 +29,9 @@ internal data class ReceiptAuthorization(
     val accessToken: String,
     val authCookie: String? = null,
     val authCookieHost: String? = null,
-)
+) {
+    override fun toString(): String = "ReceiptAuthorization(redacted)"
+}
 
 internal fun interface ReceiptSessionProvider {
     suspend fun accessToken(): String?

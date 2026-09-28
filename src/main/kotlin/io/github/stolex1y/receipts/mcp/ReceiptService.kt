@@ -101,7 +101,7 @@ internal class ReceiptService(
     private suspend fun requireAuthorization(): ReceiptAuthorization =
         sessionProvider.authorization(upstreamHost(apiBase))
             ?: throw ReceiptAuthenticationException(
-                "Сессия «Мои чеки онлайн» не настроена; login/browser bridge отложены.",
+                "Сессия «Мои чеки онлайн» не настроена; запустите ручной browser login через /receipts/browser-login.",
             )
 
     private suspend inline fun <reified T, reified R> postJson(
