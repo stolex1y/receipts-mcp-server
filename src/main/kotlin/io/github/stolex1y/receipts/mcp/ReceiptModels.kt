@@ -95,6 +95,7 @@ data class ReceiptDetail(
     @SerialName("total_minor") val totalMinor: Long,
     val currency: String = "RUB",
     val items: List<ReceiptItem>,
+    @SerialName("settlement_place") val settlementPlace: String? = null,
 )
 
 @Serializable
@@ -162,6 +163,7 @@ internal data class UpstreamFiscalDataResponse(
     val items: List<UpstreamFiscalItem>,
     val kktRegId: String,
     val totalSum: Double,
+    val retailPlace: String? = null,
 )
 
 @Serializable

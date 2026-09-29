@@ -162,6 +162,15 @@ Fixtures:
 Адрес покупателя, ИНН пользователя, provider metadata и неизвестные raw-поля
 не возвращаются.
 
+Необязательное поле `settlement_place` заполняется только из корневого
+`retailPlace` в ответе `/v1/receipt/fiscal_data`; `retailPlaceAddress` не
+используется в качестве замены и не публикуется. Расположение поля в ответе
+endpoint закреплено только синтетическим HTTP-fixture и не является
+независимым подтверждением схемы реального private API.
+
+В официальном формате ФНС `retailPlace` обозначает место расчётов, а
+`retailPlaceAddress` — адрес расчётов ([описание формата ФНС](https://www.nalog.gov.ru/html/sites/www.new.nalog.ru/docs/kkt/1_1_141_210321.pdf)).
+
 ## Private API adapter
 
 Маппинг private API изолирован в `ReceiptService` и покрыт mock HTTP-тестами:

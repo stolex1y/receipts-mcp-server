@@ -223,6 +223,7 @@ internal class ReceiptService(
     private fun UpstreamFiscalDataResponse.toDetail(receiptKey: String): ReceiptDetail = ReceiptDetail(
         receiptKey = receiptKey,
         dateTime = dateTime,
+        settlementPlace = retailPlace,
         fiscalDocumentNumber = fiscalDocumentNumber,
         fiscalDriveNumber = fiscalDriveNumber,
         fiscalSign = fiscalSign,

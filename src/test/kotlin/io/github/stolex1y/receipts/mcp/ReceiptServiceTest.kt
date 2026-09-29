@@ -136,6 +136,7 @@ class ReceiptServiceTest {
             assertEquals(34_900, result.totalMinor)
             assertEquals("Демо товар", result.items.single().name)
             assertEquals(34_900, result.items.single().sumMinor)
+            assertEquals(null, result.settlementPlace)
             assertEquals("upstream-key-001", bodyText(requests.single()).let {
                 Json.parseToJsonElement(it).jsonObject["key"]?.toString()?.trim('"')
             })
@@ -144,6 +145,100 @@ class ReceiptServiceTest {
             assertFalse(publicJson.contains("secret-inn"))
             assertFalse(publicJson.contains("secret-phone"))
             assertFalse(publicJson.contains("test-token"))
+            assertFalse(publicJson.contains("\"settlement_place\""))
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun privateDetailMapsRetailPlaceToSettlementPlace() = runBlocking {
+        val (client, _) = mockLkdr { request ->
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/api/v1/receipt/fiscal_data", request.url.encodedPath)
+            respondJson(
+                """
+                {
+                  "dateTime": "2026-09-11T12:00:00",
+                  "fiscalDocumentNumber": 1002,
+                  "fiscalDriveNumber": "synthetic-drive",
+                  "fiscalSign": "synthetic-sign",
+                  "kktRegId": "synthetic-kkt",
+                  "totalSum": 12.0,
+                  "retailPlace": "https://example.test/transit",
+                  "retailPlaceAddress": "Synthetic address, not a place value",
+                  "items": []
+                }
+                """.trimIndent(),
+            )
+        }
+        try {
+            val service = ReceiptService(
+                httpClient = client,
+                mode = ReceiptMode.PRIVATE,
+                apiBase = "https://mock.lkdr.test/api",
+                sessionProvider = object : ReceiptSessionProvider {
+                    override suspend fun accessToken(): String = "test-token"
+
+                    override suspend fun authCookie(): String = "session-cookie=opaque"
+                },
+            )
+            val result = service.getReceipt("synthetic-key")
+
+            assertEquals("https://example.test/transit", result.settlementPlace)
+            val publicJson = Json.encodeToString(result)
+            val publicFields = Json.parseToJsonElement(publicJson).jsonObject
+            assertEquals(
+                "\"https://example.test/transit\"",
+                publicFields["settlement_place"]?.toString(),
+            )
+            assertFalse(publicFields.containsKey("retailPlace"))
+            assertFalse(publicFields.containsKey("retailPlaceAddress"))
+            assertFalse(publicJson.contains("Synthetic address, not a place value"))
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun privateDetailDoesNotUseRetailPlaceAddressAsSettlementPlace() = runBlocking {
+        val (client, _) = mockLkdr { request ->
+            assertEquals(HttpMethod.Post, request.method)
+            assertEquals("/api/v1/receipt/fiscal_data", request.url.encodedPath)
+            respondJson(
+                """
+                {
+                  "dateTime": "2026-09-12T12:00:00",
+                  "fiscalDocumentNumber": 1003,
+                  "fiscalDriveNumber": "synthetic-drive",
+                  "fiscalSign": "synthetic-sign",
+                  "kktRegId": "synthetic-kkt",
+                  "totalSum": 12.0,
+                  "retailPlaceAddress": "Synthetic address only",
+                  "items": []
+                }
+                """.trimIndent(),
+            )
+        }
+        try {
+            val service = ReceiptService(
+                httpClient = client,
+                mode = ReceiptMode.PRIVATE,
+                apiBase = "https://mock.lkdr.test/api",
+                sessionProvider = object : ReceiptSessionProvider {
+                    override suspend fun accessToken(): String = "test-token"
+
+                    override suspend fun authCookie(): String = "session-cookie=opaque"
+                },
+            )
+            val result = service.getReceipt("synthetic-key")
+
+            assertEquals(null, result.settlementPlace)
+            val publicJson = Json.encodeToString(result)
+            val publicFields = Json.parseToJsonElement(publicJson).jsonObject
+            assertFalse(publicFields.containsKey("settlement_place"))
+            assertFalse(publicFields.containsKey("retailPlaceAddress"))
+            assertFalse(publicJson.contains("Synthetic address only"))
         } finally {
             client.close()
         }
