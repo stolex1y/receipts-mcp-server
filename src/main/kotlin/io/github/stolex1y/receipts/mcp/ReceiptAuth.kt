@@ -7,14 +7,17 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.contentType
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runInterruptible
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.SerialName
@@ -27,6 +30,7 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.net.URI
+import java.time.Instant
 import java.util.Locale
 
 private const val FAKE_PHONE = "+79990000000"
@@ -251,6 +255,26 @@ internal class RealReceiptAuthService(
     private val sessionSecretStore: ReceiptSessionSecretStore = KeyringReceiptSessionSecretStore(),
     private val browserLoginCapture: ReceiptBrowserLoginCapture = VisibleReceiptBrowserLoginCapture(),
 ) : ReceiptAuthService {
+    private class RefreshFlight(
+        val accessToken: String,
+        val sourceEnvelope: ReceiptSessionEnvelope,
+        var accessTokenRejected: Boolean,
+        val result: CompletableDeferred<RefreshResult>,
+    )
+
+    private sealed interface RefreshResult {
+        data class Success(val authorization: ReceiptAuthorization?) : RefreshResult
+        data class Failure(val error: Throwable) : RefreshResult
+    }
+
+    private sealed interface RefreshReservation {
+        data class Owner(val flight: RefreshFlight) : RefreshReservation
+        data class Waiter(val flight: RefreshFlight) : RefreshReservation
+        data class Ready(val authorization: ReceiptAuthorization?) : RefreshReservation
+    }
+
+    private var rejectedAccessToken = false
+    private var refreshFlight: RefreshFlight? = null
     private val mutex = Mutex()
     private val browserLoginScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var browserLoginJob: Job? = null
@@ -267,6 +291,7 @@ internal class RealReceiptAuthService(
         browserLoginJob = null
         credentialsRejected = false
         sessionMessage = null
+        rejectedAccessToken = false
         sessionStatus = null
         sessionRetryable = false
         try {
@@ -328,20 +353,59 @@ internal class RealReceiptAuthService(
     }
 
     override suspend fun authorization(apiHost: String?): ReceiptAuthorization? = mutex.withLock {
-        val current = envelope ?: return@withLock null
-        if (credentialsRejected) return@withLock null
-        val cookieHost = current.authCookieHost
-        val cookie = current.authCookie.takeIf(String::isNotBlank)
-            ?.takeIf { cookieHost != null && apiHost != null && cookieHost == apiHost.lowercase(Locale.ROOT) }
-        ReceiptAuthorization(
-            accessToken = current.accessToken,
-            authCookie = cookie,
-            authCookieHost = cookieHost,
-        )
+        authorizationLocked(envelope, apiHost)
+    }
+
+    override suspend fun refreshAfterRejection(
+        accessToken: String,
+        apiHost: String?,
+    ): ReceiptAuthorization? = refreshToken(accessToken, apiHost, tokenRejected = true)
+
+    private suspend fun refreshToken(
+        accessToken: String,
+        apiHost: String?,
+        tokenRejected: Boolean,
+    ): ReceiptAuthorization? {
+        val reservation = mutex.withLock {
+            val current = envelope ?: return@withLock RefreshReservation.Ready(null)
+            if (credentialsRejected) return@withLock RefreshReservation.Ready(null)
+            if (current.accessToken != accessToken) {
+                return@withLock RefreshReservation.Ready(authorizationLocked(current, apiHost))
+            }
+            if (tokenRejected) rejectedAccessToken = true
+            sessionStatus = "recoverable_error"
+            sessionRetryable = true
+            sessionMessage = if (tokenRejected) {
+                "Сервис чеков отклонил access token; выполняется безопасное обновление."
+            } else {
+                "Выполняется обновление receipts session."
+            }
+            val active = refreshFlight?.takeIf {
+                !it.result.isCompleted &&
+                    it.accessToken == accessToken && it.sourceEnvelope === current
+            }
+            if (active != null) {
+                if (tokenRejected) active.accessTokenRejected = true
+                RefreshReservation.Waiter(active)
+            } else {
+                val flight = RefreshFlight(accessToken, current, tokenRejected, CompletableDeferred())
+                refreshFlight = flight
+                RefreshReservation.Owner(flight)
+            }
+        }
+        return when (reservation) {
+            is RefreshReservation.Ready -> reservation.authorization
+            is RefreshReservation.Waiter -> {
+                reservation.flight.result.await().unwrapRefreshResult()
+                mutex.withLock { authorizationLocked(envelope, apiHost) }
+            }
+            is RefreshReservation.Owner -> runRefreshFlight(reservation.flight, apiHost)
+        }
     }
 
     override suspend fun invalidate() = mutex.withLock {
         credentialsRejected = true
+        rejectedAccessToken = false
         sessionStatus = "login_required"
         sessionRetryable = false
         sessionMessage = "Сессия receipts отклонена; выполните browser login."
@@ -350,17 +414,12 @@ internal class RealReceiptAuthService(
     override suspend fun invalidateIfCurrent(accessToken: String) = mutex.withLock {
         if (envelope?.accessToken == accessToken) {
             credentialsRejected = true
+            rejectedAccessToken = false
             sessionStatus = "login_required"
             sessionRetryable = false
             sessionMessage = "Сессия receipts отклонена; выполните browser login."
         }
     }
-
-    override suspend fun login(request: ReceiptLoginRequest): ReceiptLoginResponse =
-        legacyLoginDisabled()
-
-    override suspend fun resendOtp(phone: String): ReceiptLoginResponse =
-        legacyLoginDisabled()
 
     override suspend fun logout(): ReceiptSessionResponse = mutex.withLock {
         browserLoginJob?.cancel()
@@ -378,6 +437,7 @@ internal class RealReceiptAuthService(
         }
         envelope = null
         credentialsRejected = false
+        rejectedAccessToken = false
         sessionStatus = null
         sessionMessage = null
         sessionRetryable = false
@@ -390,6 +450,17 @@ internal class RealReceiptAuthService(
         if (browserLoginJob?.isActive == true) {
             return@withLock sessionResponse(isAuthenticated(), "authenticating")
         }
+        if (credentialsRejected) {
+            return@withLock sessionResponse(false, "login_required")
+        }
+        if (rejectedAccessToken || envelope?.let(::hasExpiredAccessToken) == true) {
+            return@withLock sessionResponse(
+                authenticated = false,
+                status = "recoverable_error",
+                retryable = true,
+                message = sessionMessage ?: "Access token истёк; повторите retry session или выполните запрос чеков.",
+            )
+        }
         val currentStatus = sessionStatus
         if (currentStatus != null) {
             return@withLock sessionResponse(
@@ -401,36 +472,89 @@ internal class RealReceiptAuthService(
         sessionResponse(isAuthenticated(), if (isAuthenticated()) "active" else "login_required")
     }
 
-    override suspend fun retrySession(): ReceiptSessionResponse = mutex.withLock {
-        if (browserLoginJob?.isActive == true) {
-            return@withLock sessionResponse(isAuthenticated(), "authenticating")
-        }
-        val current = envelope
-            ?: return@withLock sessionResponse(false, "login_required")
-        try {
-            refreshLocked(current)
-            credentialsRejected = false
-            sessionStatus = null
-            sessionRetryable = false
-            sessionMessage = null
-            sessionResponse(true, "active")
+    override suspend fun retrySession(): ReceiptSessionResponse {
+        val current = mutex.withLock {
+            if (browserLoginJob?.isActive == true) {
+                return@withLock null
+            }
+            envelope?.takeUnless { credentialsRejected }
+        } ?: return session()
+        return try {
+            refreshToken(current.accessToken, null, tokenRejected = false)
+            session()
         } catch (error: CancellationException) {
             throw error
-        } catch (_: ReceiptAuthenticationException) {
-            credentialsRejected = true
-            sessionStatus = "login_required"
-            sessionRetryable = false
-            sessionMessage = "Refresh token receipts отклонён; выполните ручной browser login."
-            sessionResponse(false, "login_required")
         } catch (_: Throwable) {
-            sessionStatus = "recoverable_error"
-            sessionRetryable = true
-            sessionMessage = "Не удалось обновить receipts session; повторите явный retry."
-            sessionResponse(isAuthenticated(), "recoverable_error", retryable = true)
+            session()
         }
     }
 
-    private suspend fun refreshLocked(current: ReceiptSessionEnvelope) {
+    private suspend fun runRefreshFlight(
+        flight: RefreshFlight,
+        apiHost: String?,
+    ): ReceiptAuthorization? {
+        try {
+            val refreshed = requestRefresh(flight.sourceEnvelope)
+            val authorization = mutex.withLock {
+                val current = envelope
+                if (current === flight.sourceEnvelope) {
+                    persistCandidate(refreshed)
+                    envelope = refreshed
+                    credentialsRejected = false
+                    rejectedAccessToken = false
+                    sessionStatus = null
+                    sessionRetryable = false
+                    sessionMessage = null
+                    authorizationLocked(refreshed, apiHost)
+                } else {
+                    authorizationLocked(current, apiHost)
+                }
+            }
+            flight.result.complete(RefreshResult.Success(authorization))
+            return authorization
+        } catch (error: CancellationException) {
+            flight.result.cancel(error)
+            throw error
+        } catch (error: ReceiptAuthenticationException) {
+            mutex.withLock {
+                if (envelope === flight.sourceEnvelope) {
+                    credentialsRejected = true
+                    rejectedAccessToken = false
+                    sessionStatus = "login_required"
+                    sessionRetryable = false
+                    sessionMessage = "Refresh token receipts отклонён; выполните ручной browser login."
+                }
+            }
+            flight.result.complete(RefreshResult.Failure(error))
+            throw error
+        } catch (error: Throwable) {
+            val safeError = error as? ReceiptIntegrationException
+                ?: ReceiptIntegrationException("Не удалось обновить receipts session.", error)
+            mutex.withLock {
+                if (envelope === flight.sourceEnvelope) {
+                    if (flight.accessTokenRejected) rejectedAccessToken = true
+                    sessionStatus = "recoverable_error"
+                    sessionRetryable = true
+                    sessionMessage = "Не удалось обновить receipts session; повторите явный retry."
+                }
+            }
+            flight.result.complete(RefreshResult.Failure(safeError))
+            throw safeError
+        } finally {
+            withContext(NonCancellable) {
+                mutex.withLock {
+                    if (!flight.result.isCompleted) {
+                        flight.result.cancel(
+                            CancellationException("Обновление receipts session завершилось без результата."),
+                        )
+                    }
+                    if (refreshFlight === flight) refreshFlight = null
+                }
+            }
+        }
+    }
+
+    private suspend fun requestRefresh(current: ReceiptSessionEnvelope): ReceiptSessionEnvelope {
         val refreshToken = current.refreshToken
             ?.takeIf(String::isNotBlank)
             ?: throw ReceiptAuthenticationException("Refresh token отсутствует.")
@@ -457,16 +581,15 @@ internal class RealReceiptAuthService(
             throw ReceiptIntegrationException("Сервис refresh receipts временно недоступен.")
         }
         val body = safeBody(response)
-        val refreshed = try {
+        return try {
             parseReceiptTokenResponse(body, deviceInfo)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Throwable) {
             throw ReceiptIntegrationException("Сервис refresh receipts вернул неподдерживаемый ответ.", error)
         }
-        persistCandidate(refreshed)
-        envelope = refreshed
     }
+
 
     private suspend fun completeBrowserLogin(
         attempt: Job?,
@@ -491,6 +614,7 @@ internal class RealReceiptAuthService(
         }
         envelope = candidate
         credentialsRejected = false
+        rejectedAccessToken = false
         browserLoginJob = null
         sessionStatus = null
         sessionRetryable = false
@@ -523,6 +647,12 @@ internal class RealReceiptAuthService(
         persistenceMessage = null
     }
 
+    override suspend fun login(request: ReceiptLoginRequest): ReceiptLoginResponse =
+        legacyLoginDisabled()
+
+    override suspend fun resendOtp(phone: String): ReceiptLoginResponse =
+        legacyLoginDisabled()
+
     private fun legacyLoginDisabled() = ReceiptLoginResponse(
         status = "error",
         message = "Real receipts auth доступна только через ручной visible browser login.",
@@ -530,7 +660,43 @@ internal class RealReceiptAuthService(
         persistenceMessage = persistenceMessage,
     )
 
-    private fun isAuthenticated(): Boolean = envelope != null && !credentialsRejected
+    private fun authorizationLocked(
+        current: ReceiptSessionEnvelope?,
+        apiHost: String?,
+    ): ReceiptAuthorization? {
+        if (current == null || credentialsRejected) return null
+        val cookieHost = current.authCookieHost
+        val cookie = current.authCookie.takeIf(String::isNotBlank)
+            ?.takeIf { cookieHost != null && apiHost != null && cookieHost == apiHost.lowercase(Locale.ROOT) }
+        return ReceiptAuthorization(
+            accessToken = current.accessToken,
+            authCookie = cookie,
+            authCookieHost = cookieHost,
+        )
+    }
+
+    private fun hasExpiredAccessToken(current: ReceiptSessionEnvelope): Boolean {
+        val now = Instant.now()
+        val tokenExpiry = current.tokenExpireIn?.let { value ->
+            runCatching { Instant.parse(value) }.getOrNull()
+        }
+        if (tokenExpiry != null) return !tokenExpiry.isAfter(now)
+        val issuedAt = current.tokenIssuedAtEpochMs
+        val expiresIn = current.expiresInSeconds
+        if (issuedAt != null && expiresIn != null) {
+            val expiry = runCatching { Instant.ofEpochMilli(issuedAt).plusSeconds(expiresIn) }.getOrNull()
+            if (expiry != null) return !expiry.isAfter(now)
+        }
+        return false
+    }
+
+    private fun RefreshResult.unwrapRefreshResult(): ReceiptAuthorization? = when (this) {
+        is RefreshResult.Success -> authorization
+        is RefreshResult.Failure -> throw error
+    }
+
+    private fun isAuthenticated(): Boolean =
+        envelope?.let { !credentialsRejected && !rejectedAccessToken && !hasExpiredAccessToken(it) } == true
 
     private fun sessionResponse(
         authenticated: Boolean,

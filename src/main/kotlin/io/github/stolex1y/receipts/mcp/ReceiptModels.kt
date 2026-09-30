@@ -46,6 +46,13 @@ internal fun interface ReceiptSessionProvider {
     }
     suspend fun invalidate() = Unit
     suspend fun invalidateIfCurrent(accessToken: String) = Unit
+    suspend fun refreshAfterRejection(
+        accessToken: String,
+        apiHost: String? = null,
+    ): ReceiptAuthorization? {
+        invalidateIfCurrent(accessToken)
+        return null
+    }
 }
 internal object EmptyReceiptSessionProvider : ReceiptSessionProvider {
     override suspend fun accessToken(): String? = null

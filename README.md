@@ -48,16 +48,23 @@ request body whitelist `deviceInfo` (`appVersion`, `sourceDeviceId`,
 persistent GNOME Keyring collection. `default` alias только читается и никогда
 не изменяется.
 `java-keyring` используется для остальных платформ.
-Ошибка записи keyring не сообщает об успешном login и не
-заменяет предыдущую сохранённую сессию. `GET /receipts/session` только сообщает
-текущее состояние и не выполняет refresh. Refresh запускается явно через
-`POST /receipts/session/retry`: фиксированный endpoint
-`https://lkdr.nalog.gov.ru/api/v1/auth/token` получает `refreshToken` вместе
-с сохранённым whitelist `deviceInfo`; новые токены сохраняются до публикации
-успешного состояния. Ни auth client, ни receipt API client не следуют HTTP
-redirects: refresh body и bearer token не пересылаются другому host. Ошибка
-refresh сохраняет прежнюю сессию. Logout удаляет app-specific item из
-persistent keyring collection.
+Ошибка записи keyring не сообщает об успешном login и не заменяет предыдущую сохранённую сессию.
+`GET /receipts/session` только сообщает текущее состояние и не выполняет refresh.
+Явный refresh запускается через `POST /receipts/session/retry`; private search/get
+также один раз обновляют session, если API отклоняет access token.
+В обоих случаях фиксированный endpoint
+`https://lkdr.nalog.gov.ru/api/v1/auth/token` получает сохранённые `refreshToken`
+и whitelist `deviceInfo`; новые токены сохраняются до публикации успешного
+состояния. Одновременные запросы с одним отклонённым access token используют
+один refresh; private API повторяется не более одного раза и только с
+обновлённой авторизацией. Временный сбой refresh сохраняет session и сообщает
+`recoverable_error`, а отклонённый refresh token требует ручного browser login.
+Когда сохранённые `tokenExpireIn` или пара `token_issued_at_epoch_ms` /
+`expires_in_seconds` однозначно указывают истечение, status сообщает
+`recoverable_error` до следующего refresh; неизвестный/неразбираемый формат
+expiry не интерпретируется. Ни auth client, ни receipt API client не следуют
+HTTP redirects: refresh body и bearer token не пересылаются другому host.
+Logout удаляет app-specific item из persistent keyring collection.
 
 JSON phone/password/OTP routes оставлены только для deterministic fake server.
 Real server отклоняет `/receipts/login` и `/receipts/otp/resend` с HTTP 403 до
@@ -194,7 +201,11 @@ MCP-контракт. Private API не является официальным �
 - whitelist deviceInfo, захват только полей успешного verify response и
   отсутствие чтения OTP verify request body;
 - восстановление/refresh с нужными `deviceInfo` и `refreshToken`, status-only
-  polling, явный retry и logout;
+  polling без external refresh, явный retry и logout;
+- private search/get обновляют отвергнутый access token через один совместный
+  refresh, повторяют запрос один раз с rotated token и не зацикливаются;
+- истёкший известный expiry отображается как `recoverable_error`; transient
+  refresh failure сохраняет session, а rejection refresh token требует login;
 - keyring write failure без ложного успешного login или потери старых данных;
 - явный выбор persistent GNOME Keyring collection, reuse app-specific item после
   изменения default alias и отсутствие alias mutation/session-only хранения;

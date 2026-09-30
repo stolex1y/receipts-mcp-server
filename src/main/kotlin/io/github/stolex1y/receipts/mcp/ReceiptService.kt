@@ -74,8 +74,7 @@ internal class ReceiptService(
                 offset = input.offset,
                 orderBy = input.orderBy,
             ),
-            accessToken = authorization.accessToken,
-            authCookie = authorization.authCookie,
+            authorization = authorization,
         )
         val brands = source.brands.associateBy(UpstreamBrand::id)
         return ReceiptSearchResponse(
@@ -83,13 +82,13 @@ internal class ReceiptService(
             hasMore = source.hasMore,
         )
     }
+
     private suspend fun privateGetReceipt(receiptKey: String): ReceiptDetail {
         val authorization = requireAuthorization()
         val source = postJson<UpstreamFiscalDataRequest, UpstreamFiscalDataResponse>(
             path = "/v1/receipt/fiscal_data",
             request = UpstreamFiscalDataRequest(key = receiptKey),
-            accessToken = authorization.accessToken,
-            authCookie = authorization.authCookie,
+            authorization = authorization,
         )
         return source.toDetail(receiptKey)
     }
@@ -107,22 +106,20 @@ internal class ReceiptService(
     private suspend inline fun <reified T, reified R> postJson(
         path: String,
         request: T,
-        accessToken: String,
-        authCookie: String?,
+        authorization: ReceiptAuthorization,
     ): R {
-        val response = try {
-            httpClient.post(apiBase + path) {
-                contentType(ContentType.Application.Json)
-                header(HttpHeaders.Authorization, "Bearer $accessToken")
-                authCookie
-                    ?.takeIf(String::isNotBlank)
-                    ?.let { header(HttpHeaders.Cookie, it) }
-                setBody(apiJson.encodeToString(request))
+        val requestBody = apiJson.encodeToString(request)
+        var response = sendJson(path, requestBody, authorization)
+        if (response.status.value == 401 || response.status.value == 403) {
+            val refreshed = sessionProvider.refreshAfterRejection(
+                accessToken = authorization.accessToken,
+                apiHost = upstreamHost(apiBase),
+            ) ?: throw ReceiptAuthenticationException("Сессия сервиса чеков отклонена или истекла.")
+            response = sendJson(path, requestBody, refreshed)
+            if (response.status.value == 401 || response.status.value == 403) {
+                sessionProvider.invalidateIfCurrent(refreshed.accessToken)
+                throw ReceiptAuthenticationException("Сервис чеков отклонил обновлённую сессию.")
             }
-        } catch (error: CancellationException) {
-            throw error
-        } catch (error: Throwable) {
-            throw ReceiptIntegrationException("Не удалось обратиться к сервису чеков.", error)
         }
 
         val body = try {
@@ -134,18 +131,32 @@ internal class ReceiptService(
         }
 
         if (response.status.value !in 200..299) {
-            if (response.status.value == 401 || response.status.value == 403) {
-                sessionProvider.invalidateIfCurrent(accessToken)
-                throw ReceiptAuthenticationException("Сессия сервиса чеков отклонена или истекла.")
-            }
             throw ReceiptIntegrationException("Сервис чеков временно недоступен.")
         }
-
         return try {
             apiJson.decodeFromString<R>(body)
         } catch (error: Throwable) {
             throw ReceiptIntegrationException("Сервис чеков вернул некорректный JSON.", error)
         }
+    }
+
+    private suspend fun sendJson(
+        path: String,
+        requestBody: String,
+        authorization: ReceiptAuthorization,
+    ): io.ktor.client.statement.HttpResponse = try {
+        httpClient.post(apiBase + path) {
+            contentType(ContentType.Application.Json)
+            header(HttpHeaders.Authorization, "Bearer ${authorization.accessToken}")
+            authorization.authCookie
+                ?.takeIf(String::isNotBlank)
+                ?.let { header(HttpHeaders.Cookie, it) }
+            setBody(requestBody)
+        }
+    } catch (error: CancellationException) {
+        throw error
+    } catch (error: Throwable) {
+        throw ReceiptIntegrationException("Не удалось обратиться к сервису чеков.", error)
     }
 
     private fun validate(input: ReceiptSearchInput): ReceiptSearchInput {

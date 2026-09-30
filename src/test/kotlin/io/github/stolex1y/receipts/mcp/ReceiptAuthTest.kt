@@ -22,13 +22,23 @@ import io.ktor.server.application.install
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.withTimeout
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.time.Instant
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.Test
 import kotlin.test.assertContains
 import kotlin.test.assertEquals
@@ -323,7 +333,7 @@ class ReceiptAuthTest {
     }
 
     @Test
-    fun preV30V1KeyringBytesSurviveRestoreAndFailedBrowserLoginUnchanged() = runBlocking {
+    fun expiredPreV30V1KeyringBytesSurviveRestoreAndFailedBrowserLoginUnchanged() = runBlocking {
         val legacyBytes =
             """{"version":1,"access_token":"legacy-access","refresh_token":"legacy-refresh","session_id":"legacy-session","auth_cookie":"legacy-cookie","auth_cookie_host":"mco.nalog.ru","expires_in_seconds":3600,"token_issued_at_epoch_ms":1730000000000}"""
         assertFalse(legacyBytes.contains("device_info"))
@@ -338,13 +348,13 @@ class ReceiptAuthTest {
         )
         try {
             auth.restore()
-            assertEquals("active", auth.session().status)
+            assertEquals("recoverable_error", auth.session().status)
             assertEquals(legacyBytes, store.value)
             assertEquals("authenticating", auth.startBrowserLogin().status)
-            val failed = awaitStatus(auth, "active")
+            val failed = awaitStatus(auth, "recoverable_error")
 
-            assertTrue(failed.authenticated)
-            assertContains(failed.message.orEmpty(), "предыдущая session сохранена")
+            assertFalse(failed.authenticated)
+            assertContains(failed.message.orEmpty(), "browser login")
             assertFalse(failed.message.orEmpty().contains("capture-failure-marker"))
             assertEquals("legacy-access", auth.accessToken())
             assertEquals(legacyBytes, store.value)
@@ -363,6 +373,255 @@ class ReceiptAuthTest {
             assertEquals("error", auth.resendOtp(FAKE_PHONE).status)
             assertEquals(0, calls)
             assertNull(auth.accessToken())
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun privateSearchRefreshesARejectedRestoredSessionWithPersistedRefreshContext() = runBlocking {
+        val old = oldEnvelope()
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(old))
+        val refreshCalls = AtomicInteger()
+        val apiAuthorizations = CopyOnWriteArrayList<String?>()
+        val client = HttpClient(MockEngine { request ->
+            if (request.url.host == "lkdr.nalog.gov.ru") {
+                refreshCalls.incrementAndGet()
+                val body = Json.parseToJsonElement(bodyText(request)).jsonObject
+                assertEquals(setOf("deviceInfo", "refreshToken"), body.keys)
+                assertEquals(old.deviceInfo, body["deviceInfo"])
+                assertEquals("old-refresh", body["refreshToken"]?.jsonPrimitive?.content)
+                jsonResponse("""{"token":"rotated-access","refreshToken":"rotated-refresh"}""")
+            } else {
+                apiAuthorizations += request.headers[HttpHeaders.Authorization]
+                if (request.headers[HttpHeaders.Authorization] == "Bearer old-access") {
+                    jsonResponse("{}", HttpStatusCode.Unauthorized)
+                } else {
+                    jsonResponse("""{"brands":[],"receipts":[],"hasMore":false}""")
+                }
+            }
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            assertEquals("active", auth.session().status)
+            assertEquals(0, refreshCalls.get(), "session polling must remain network-free")
+            val service = ReceiptService(client, ReceiptMode.PRIVATE, sessionProvider = auth)
+
+            val result = service.search(ReceiptSearchInput())
+
+            assertTrue(result.receipts.isEmpty())
+            assertEquals(listOf<String?>("Bearer old-access", "Bearer rotated-access"), apiAuthorizations.toList())
+            assertEquals(1, refreshCalls.get())
+            assertEquals("rotated-access", auth.accessToken())
+            assertContains(store.value.orEmpty(), "rotated-refresh")
+            assertEquals("active", auth.session().status)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun privateDetailRefreshesOnForbiddenAndRetriesOnlyOnce() = runBlocking {
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(oldEnvelope()))
+        val refreshCalls = AtomicInteger()
+        val apiAuthorizations = CopyOnWriteArrayList<String?>()
+        val client = HttpClient(MockEngine { request ->
+            if (request.url.host == "lkdr.nalog.gov.ru") {
+                refreshCalls.incrementAndGet()
+                jsonResponse("""{"token":"rotated-access","refreshToken":"rotated-refresh"}""")
+            } else {
+                apiAuthorizations += request.headers[HttpHeaders.Authorization]
+                if (request.headers[HttpHeaders.Authorization] == "Bearer old-access") {
+                    jsonResponse("{}", HttpStatusCode.Forbidden)
+                } else {
+                    jsonResponse(
+                        """{
+                          "dateTime":"2026-09-10T12:00:00",
+                          "fiscalDocumentNumber":1001,
+                          "fiscalDriveNumber":"999900010001",
+                          "fiscalSign":"700001",
+                          "items":[],
+                          "kktRegId":"0001112223334444",
+                          "totalSum":349.0
+                        }""",
+                    )
+                }
+            }
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val service = ReceiptService(client, ReceiptMode.PRIVATE, sessionProvider = auth)
+
+            val result = service.getReceipt("synthetic-receipt-key")
+
+            assertEquals("synthetic-receipt-key", result.receiptKey)
+            assertEquals(listOf<String?>("Bearer old-access", "Bearer rotated-access"), apiAuthorizations.toList())
+            assertEquals(1, refreshCalls.get())
+            assertEquals("active", auth.session().status)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun transientRefreshFailureStaysRecoverableInsteadOfRequiringLogin() = runBlocking {
+        val original = encodeEnvelope(oldEnvelope())
+        val store = MemoryReceiptSessionSecretStore(original)
+        val refreshCalls = AtomicInteger()
+        val client = HttpClient(MockEngine { request ->
+            if (request.url.host == "lkdr.nalog.gov.ru") {
+                refreshCalls.incrementAndGet()
+                jsonResponse("{}", HttpStatusCode.BadGateway)
+            } else {
+                jsonResponse("{}", HttpStatusCode.Unauthorized)
+            }
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val service = ReceiptService(client, ReceiptMode.PRIVATE, sessionProvider = auth)
+
+            assertFailsWith<ReceiptIntegrationException> {
+                service.search(ReceiptSearchInput())
+            }
+
+            val state = auth.session()
+            assertEquals("recoverable_error", state.status)
+            assertFalse(state.authenticated)
+            assertTrue(state.retryable)
+            assertEquals(1, refreshCalls.get())
+            assertEquals(original, store.value)
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun rejectedRefreshRequiresLoginWithoutRetryLoop() = runBlocking {
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(oldEnvelope()))
+        val apiCalls = AtomicInteger()
+        val refreshCalls = AtomicInteger()
+        val client = HttpClient(MockEngine { request ->
+            if (request.url.host == "lkdr.nalog.gov.ru") {
+                refreshCalls.incrementAndGet()
+                jsonResponse("{}", HttpStatusCode.Forbidden)
+            } else {
+                apiCalls.incrementAndGet()
+                jsonResponse("{}", HttpStatusCode.Unauthorized)
+            }
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val service = ReceiptService(client, ReceiptMode.PRIVATE, sessionProvider = auth)
+
+            assertFailsWith<ReceiptAuthenticationException> {
+                service.search(ReceiptSearchInput())
+            }
+
+            assertEquals("login_required", auth.session().status)
+            assertFalse(auth.session().authenticated)
+            assertEquals(1, apiCalls.get())
+            assertEquals(1, refreshCalls.get())
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun secondPrivateRejectionAfterRefreshRequiresLoginAndDoesNotLoop() = runBlocking {
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(oldEnvelope()))
+        val apiAuthorizations = CopyOnWriteArrayList<String?>()
+        val refreshCalls = AtomicInteger()
+        val client = HttpClient(MockEngine { request ->
+            if (request.url.host == "lkdr.nalog.gov.ru") {
+                refreshCalls.incrementAndGet()
+                jsonResponse("""{"token":"rotated-access","refreshToken":"rotated-refresh"}""")
+            } else {
+                apiAuthorizations += request.headers[HttpHeaders.Authorization]
+                jsonResponse("{}", HttpStatusCode.Unauthorized)
+            }
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val service = ReceiptService(client, ReceiptMode.PRIVATE, sessionProvider = auth)
+
+            assertFailsWith<ReceiptAuthenticationException> {
+                service.search(ReceiptSearchInput())
+            }
+
+            assertEquals(listOf<String?>("Bearer old-access", "Bearer rotated-access"), apiAuthorizations.toList())
+            assertEquals(1, refreshCalls.get())
+            assertEquals("login_required", auth.session().status)
+        } finally {
+            client.close()
+        }
+    }
+
+
+    @Test
+    fun concurrentRejectedRequestsShareOneRefreshAndRetryWithTheRotatedToken() = runBlocking {
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(oldEnvelope()))
+        val oldRequestsArrived = CompletableDeferred<Unit>()
+        val oldRequestCount = AtomicInteger()
+        val refreshCalls = AtomicInteger()
+        val apiAuthorizations = CopyOnWriteArrayList<String?>()
+        val client = HttpClient(MockEngine { request ->
+            if (request.url.host == "lkdr.nalog.gov.ru") {
+                refreshCalls.incrementAndGet()
+                jsonResponse("""{"token":"rotated-access","refreshToken":"rotated-refresh"}""")
+            } else {
+                val authorization = request.headers[HttpHeaders.Authorization]
+                apiAuthorizations += authorization
+                if (authorization == "Bearer old-access") {
+                    if (oldRequestCount.incrementAndGet() == 2) oldRequestsArrived.complete(Unit)
+                    withTimeout(5_000) { oldRequestsArrived.await() }
+                    jsonResponse("{}", HttpStatusCode.Unauthorized)
+                } else {
+                    jsonResponse("""{"brands":[],"receipts":[],"hasMore":false}""")
+                }
+            }
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val service = ReceiptService(client, ReceiptMode.PRIVATE, sessionProvider = auth)
+
+            val results = listOf(
+                async(Dispatchers.Default) { service.search(ReceiptSearchInput()) },
+                async(Dispatchers.Default) { service.search(ReceiptSearchInput()) },
+            ).awaitAll()
+
+            assertEquals(2, results.size)
+            assertEquals(2, oldRequestCount.get())
+            assertEquals(1, refreshCalls.get())
+            assertEquals(4, apiAuthorizations.size)
+            assertEquals(2, apiAuthorizations.count { it == "Bearer old-access" })
+            assertEquals(2, apiAuthorizations.count { it == "Bearer rotated-access" })
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun expiredMetadataIsReportedWithoutRefreshingDuringSessionPolling() = runBlocking {
+        val expired = oldEnvelope().copy(tokenExpireIn = Instant.now().minusSeconds(60).toString())
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(expired))
+        var httpCalls = 0
+        val client = HttpClient(MockEngine { httpCalls += 1; error("session polling must not use HTTP") })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+
+            val state = auth.session()
+
+            assertEquals("recoverable_error", state.status)
+            assertFalse(state.authenticated)
+            assertTrue(state.retryable)
+            assertEquals(0, httpCalls)
         } finally {
             client.close()
         }
@@ -425,6 +684,192 @@ class ReceiptAuthTest {
     }
 
     @Test
+    fun cancelledRefreshOwnerCleansItsFlightBeforeRetrying() = runBlocking {
+        val old = oldEnvelope()
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(old))
+        val firstRefreshStarted = CompletableDeferred<Unit>()
+        val firstRefreshCancelled = CompletableDeferred<Unit>()
+        val refreshCalls = AtomicInteger()
+        val client = HttpClient(MockEngine { request ->
+            assertEquals("lkdr.nalog.gov.ru", request.url.host)
+            val refreshCall = refreshCalls.incrementAndGet()
+            val body = Json.parseToJsonElement(bodyText(request)).jsonObject
+            assertEquals(setOf("deviceInfo", "refreshToken"), body.keys)
+            assertEquals("old-refresh", body["refreshToken"]?.jsonPrimitive?.content)
+            assertEquals(old.deviceInfo, body["deviceInfo"])
+            if (refreshCall == 1) {
+                firstRefreshStarted.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    firstRefreshCancelled.complete(Unit)
+                }
+            }
+            jsonResponse("""{"token":"new-access","refreshToken":"new-refresh"}""")
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val mutex = RealReceiptAuthService::class.java
+                .getDeclaredField("mutex")
+                .apply { isAccessible = true }
+                .get(auth) as Mutex
+            val owner = async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+                auth.retrySession()
+            }
+
+            firstRefreshStarted.await()
+            mutex.lock()
+            try {
+                owner.cancel()
+                withTimeout(5_000) { firstRefreshCancelled.await() }
+                assertFalse(owner.isCompleted, "refresh cleanup must wait for the held mutex")
+            } finally {
+                mutex.unlock()
+            }
+            withTimeout(5_000) { owner.join() }
+
+            val retried = auth.retrySession()
+
+            assertEquals("active", retried.status)
+            assertEquals(2, refreshCalls.get())
+            assertEquals("new-access", auth.accessToken())
+            assertContains(store.value.orEmpty(), "new-refresh")
+        } finally {
+            client.close()
+        }
+    }
+
+    @Test
+    fun callerQueuedBeforeCancelledFlightCleanupBecomesNewRefreshOwner() = runBlocking {
+        val old = oldEnvelope()
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(old))
+        val firstRefreshStarted = CompletableDeferred<Unit>()
+        val firstRefreshCancelled = CompletableDeferred<Unit>()
+        val refreshCalls = AtomicInteger()
+        val client = HttpClient(MockEngine { request ->
+            assertEquals("lkdr.nalog.gov.ru", request.url.host)
+            val refreshCall = refreshCalls.incrementAndGet()
+            if (refreshCall == 1) {
+                firstRefreshStarted.complete(Unit)
+                try {
+                    awaitCancellation()
+                } finally {
+                    firstRefreshCancelled.complete(Unit)
+                }
+            }
+            jsonResponse("""{"token":"new-access","refreshToken":"new-refresh"}""")
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val mutex = RealReceiptAuthService::class.java
+                .getDeclaredField("mutex")
+                .apply { isAccessible = true }
+                .get(auth) as Mutex
+            val owner = async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+                auth.refreshAfterRejection("old-access", null)
+            }
+
+            firstRefreshStarted.await()
+            val refreshFlight = RealReceiptAuthService::class.java
+                .getDeclaredField("refreshFlight")
+                .apply { isAccessible = true }
+                .get(auth) ?: error("refresh flight must be reserved before its request starts")
+            val flightResult = refreshFlight.javaClass
+                .getDeclaredField("result")
+                .apply { isAccessible = true }
+                .get(refreshFlight) as CompletableDeferred<*>
+
+            mutex.lock()
+            val queuedCaller = async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+                auth.refreshAfterRejection("old-access", null)
+            }
+            try {
+                assertFalse(queuedCaller.isCompleted, "new caller must queue on the held auth mutex")
+                owner.cancel()
+                withTimeout(5_000) { firstRefreshCancelled.await() }
+                withTimeout(5_000) { flightResult.join() }
+                assertTrue(flightResult.isCancelled, "owner cancellation must complete the old flight")
+                assertFalse(owner.isCompleted, "old flight cleanup must still wait for the held mutex")
+            } finally {
+                mutex.unlock()
+            }
+
+            val authorization = withTimeout(5_000) { queuedCaller.await() }
+            withTimeout(5_000) { owner.join() }
+
+            assertEquals("new-access", authorization?.accessToken)
+            assertEquals(2, refreshCalls.get())
+            assertEquals("new-access", auth.accessToken())
+            assertContains(store.value.orEmpty(), "new-refresh")
+        } finally {
+            client.close()
+        }
+    }
+
+
+    @Test
+    fun cancelledRefreshFailureOwnerCompletesWaitersBeforeRetrying() = runBlocking {
+        val old = oldEnvelope()
+        val store = MemoryReceiptSessionSecretStore(encodeEnvelope(old))
+        val firstRefreshStarted = CompletableDeferred<Unit>()
+        val allowFirstFailure = CompletableDeferred<Unit>()
+        val refreshCalls = AtomicInteger()
+        val client = HttpClient(MockEngine { request ->
+            assertEquals("lkdr.nalog.gov.ru", request.url.host)
+            val refreshCall = refreshCalls.incrementAndGet()
+            if (refreshCall == 1) {
+                firstRefreshStarted.complete(Unit)
+                allowFirstFailure.await()
+                jsonResponse("{}", HttpStatusCode.Unauthorized)
+            } else {
+                jsonResponse("""{"token":"new-access","refreshToken":"new-refresh"}""")
+            }
+        })
+        try {
+            val auth = RealReceiptAuthService(client, store)
+            auth.restore()
+            val mutex = RealReceiptAuthService::class.java
+                .getDeclaredField("mutex")
+                .apply { isAccessible = true }
+                .get(auth) as Mutex
+            val owner = async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+                auth.refreshAfterRejection("old-access", null)
+            }
+
+            firstRefreshStarted.await()
+            val waiter = async(Dispatchers.Unconfined, start = CoroutineStart.UNDISPATCHED) {
+                auth.refreshAfterRejection("old-access", null)
+            }
+            assertFalse(waiter.isCompleted, "concurrent request must wait for the active refresh")
+
+            mutex.lock()
+            try {
+                allowFirstFailure.complete(Unit)
+                assertFalse(owner.isCompleted, "failed refresh handler must wait for the held mutex")
+                owner.cancel()
+            } finally {
+                mutex.unlock()
+            }
+            withTimeout(5_000) { owner.join() }
+            withTimeout(5_000) { waiter.join() }
+            assertTrue(waiter.isCancelled, "waiter must be released when the owner is cancelled")
+
+            val retried = auth.retrySession()
+
+            assertEquals("active", retried.status)
+            assertEquals(2, refreshCalls.get())
+            assertEquals("new-access", auth.accessToken())
+            assertContains(store.value.orEmpty(), "new-refresh")
+        } finally {
+            allowFirstFailure.complete(Unit)
+            client.close()
+        }
+    }
+
+
+    @Test
     fun refreshFailureIsRetryableAndKeepsStoredSession() = runBlocking {
         val original = encodeEnvelope(oldEnvelope())
         val store = MemoryReceiptSessionSecretStore(original)
@@ -436,6 +881,7 @@ class ReceiptAuthTest {
             val failed = auth.retrySession()
             assertEquals("recoverable_error", failed.status)
             assertTrue(failed.retryable)
+            assertTrue(failed.authenticated)
             assertEquals(original, store.value)
             assertEquals("old-access", auth.accessToken())
         } finally {
